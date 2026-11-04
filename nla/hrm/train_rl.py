@@ -249,6 +249,11 @@ def main() -> None:
     p.add_argument("--max-new-tokens", type=int, default=300)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=200)
+    p.add_argument("--shuffle-seed", type=int, default=None,
+                   help="shuffle the RL rows with this seed before training. Default (None): the rows are used in FILE ORDER, "
+                        "batch k = rows [16k, 16k+16): a run of N steps only ever sees the first N*batch_size rows of the "
+                        "parquet (E18 saw the first 24k of 110k rows; the parquet order follows the length-sorted extraction "
+                        "batches, to be verified), and two runs from the same SFT start see the SAME prompts")
     p.add_argument("--policy-lr", type=float, default=1e-5)
     p.add_argument("--ar-lr", type=float, default=1e-4)
     p.add_argument("--kl-beta", type=float, default=0.01)
@@ -293,6 +298,10 @@ def main() -> None:
     model, tokenizer = load_verbalizer(verbalizer_model, device=args.device, torch_dtype=dtype)
     d_verb = model.config.hidden_size
     rows, meta = _load_rl_rows(args.rl_parquet)
+    if args.shuffle_seed is not None:
+        import random
+        random.Random(args.shuffle_seed).shuffle(rows)
+        print(f"[train_rl] shuffled {len(rows)} RL rows with seed {args.shuffle_seed}")
     if args.w_fact:
         assert args.split_av, "--w-fact is defined for the split AV (--split-av) only"
         assert all(r.get("context_marked") and r.get("position") is not None and r.get("prompt_len") for r in rows[:100]), (
