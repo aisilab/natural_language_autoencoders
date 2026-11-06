@@ -13,13 +13,15 @@ import json
 
 import pyarrow.parquet as pq
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from nla.hrm.devices import default_device, default_dtype
 from nla.datagen.storage import LocalStorage
 from nla.hrm.build import _INJECT_H_PLACEHOLDER, _INJECT_L_PLACEHOLDER, prefix_token_mask
-from nla.hrm.model import DEFAULT_VERBALIZER, InjectionAdapter, build_inputs_embeds, load_verbalizer, render_av_prompt, save_extra_modules
+from nla.hrm.model import (
+    InjectionAdapter, build_inputs_embeds, generate_kwargs, is_mimir, load_verbalizer, render_av_prompt,
+    resolve_verbalizer_model, response_token_ce, save_extra_modules, write_backbone,
+)
 from nla.hrm.sidecar import read_sidecar
 from nla.schema import extract_explanation
 
@@ -81,8 +83,9 @@ def generate_and_check(model, tokenizer, row, inj_l_char, inj_h_char, inj_L, inj
     z_L = torch.tensor([row["z_L"]], dtype=torch.float32, device=device)
     z_H = torch.tensor([row["z_H"]], dtype=torch.float32, device=device)
     embeds = build_inputs_embeds(model, prompt_ids, z_L, z_H, inj_L, inj_H, *ids_meta)
-    out_ids = model.generate(inputs_embeds=embeds, max_new_tokens=max_new_tokens, do_sample=False,
-                               pad_token_id=tokenizer.pad_token_id)
+    attn = torch.ones(embeds.shape[:2], dtype=torch.long, device=device)
+    out_ids = model.generate(inputs_embeds=embeds, attention_mask=attn, max_new_tokens=max_new_tokens, do_sample=False,
+                               pad_token_id=tokenizer.pad_token_id, **generate_kwargs(model, attn))
     text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
     expl = extract_explanation(text)
     parsed = expl is not None and expl.count("L:") >= 1 and expl.count("H:") >= 1
@@ -93,7 +96,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--train-parquet", required=True)
     p.add_argument("--eval-parquet", default=None)
-    p.add_argument("--verbalizer-model", default=None)
+    p.add_argument("--verbalizer-model", default=None,
+                    help="AV base model. Default: the backbone recorded in --init-from, else Qwen2.5-1.5B-Instruct. Pass "
+                         "danish-foundation-models/DFM-Mimir-v1.5 for a Mimir-native AV (data built with build.py "
+                         "--verbalizer-model of the same name)")
     p.add_argument("--device", default=default_device())
     p.add_argument("--dtype", choices=["float32", "bfloat16"], default=default_dtype())
     p.add_argument("--batch-size", type=int, default=8)
@@ -122,7 +128,7 @@ def main() -> None:
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
-    verbalizer_model = args.verbalizer_model or DEFAULT_VERBALIZER
+    verbalizer_model = resolve_verbalizer_model(args.verbalizer_model, args.init_from)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
 
     model, tokenizer = load_verbalizer(verbalizer_model, device=args.device, torch_dtype=dtype)
@@ -138,7 +144,11 @@ def main() -> None:
     )
 
     init_scale = args.injection_scale_init
-    if init_scale is None and args.norm_stats_json:
+    if is_mimir(model):
+        # Mimir multiplies input embeddings by embedding_scale, so 1/embedding_scale puts z (norm ~ sqrt(d)) at the model's
+        # native input scale; the Qwen heuristic from norm_stats does not apply.
+        init_scale = init_scale or 1.0 / model.config.embedding_scale
+    elif init_scale is None and args.norm_stats_json:
         stats = json.load(open(args.norm_stats_json))
         init_scale = stats.get("injection_scale_p75")
     init_scale = init_scale or 5.0
@@ -174,16 +184,12 @@ def main() -> None:
             batch = [examples[i] for i in order[start : start + args.batch_size]]
             input_ids, labels, attn, z_L, z_H = _collate(batch, tokenizer.pad_token_id, args.device)
             embeds = build_inputs_embeds(model, input_ids, z_L, z_H, inj_L, inj_H, *ids_meta)
-            out = model(inputs_embeds=embeds, attention_mask=attn)
-            logits = out.logits[:, :-1].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
+            ce = response_token_ce(model, embeds, attn, labels)  # [B, S-1], 0 on ignored positions
             if args.prefix_weight != 1.0:
-                ce = F.cross_entropy(logits.view(-1, logits.size(-1)).float(), shift_labels.view(-1),
-                                     ignore_index=-100, reduction="none").view_as(shift_labels)
                 w = _token_weights(batch, labels, args.prefix_weight)[:, 1:]
                 loss = (ce * w).sum() / w.sum().clamp_min(1.0)
             else:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)).float(), shift_labels.view(-1), ignore_index=-100)
+                loss = ce.sum() / (labels[:, 1:] != -100).sum().clamp_min(1)
 
             optim.zero_grad()
             loss.backward()
@@ -195,6 +201,7 @@ def main() -> None:
                 from pathlib import Path as _P
                 _P(f"{args.output}/step_{step}").mkdir(parents=True, exist_ok=True)
                 model.save_pretrained(f"{args.output}/step_{step}", selected_adapters=["av"])
+                write_backbone(f"{args.output}/step_{step}", verbalizer_model)
                 from nla.hrm.model import ReconHeads as _RH
                 save_extra_modules(f"{args.output}/step_{step}/extra_modules.safetensors", inj_L, inj_H,
                                    _RH(_D_MIMIR, model.config.hidden_size))
@@ -217,6 +224,7 @@ def main() -> None:
     from pathlib import Path
     Path(args.output).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(args.output, selected_adapters=["av"])
+    write_backbone(args.output, verbalizer_model)
     from nla.hrm.model import ReconHeads
     save_extra_modules(f"{args.output}/extra_modules.safetensors", inj_L, inj_H,
                          ReconHeads(_D_MIMIR, model.config.hidden_size))

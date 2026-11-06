@@ -26,7 +26,7 @@ from nla.hrm.build import _INJECT_H_PLACEHOLDER, _INJECT_L_PLACEHOLDER
 from nla.hrm.devices import default_device, default_dtype
 from nla.hrm.eval import generate_and_reconstruct
 from nla.hrm.mimir import DEFAULT_MIMIR, HrmStreamCapture, context_marked, load_mimir, render_and_encode_batch
-from nla.hrm.model import DEFAULT_VERBALIZER, load_rl_checkpoint, load_verbalizer
+from nla.hrm.model import load_rl_checkpoint, load_verbalizer, resolve_verbalizer_model
 from nla.hrm.recon import ReconWeights, recon_loss
 from nla.hrm.sidecar import read_sidecar
 
@@ -44,7 +44,7 @@ def main() -> None:
     p.add_argument("--ar-ckpt")
     p.add_argument("--sidecar-from", help="a built parquet (rl.parquet) — supplies markers/templates")
     p.add_argument("--base-model", default=DEFAULT_MIMIR)
-    p.add_argument("--verbalizer-model", default=DEFAULT_VERBALIZER)
+    p.add_argument("--verbalizer-model", default=None, help="default: the backbone recorded in --av-ckpt, else Qwen2.5-1.5B-Instruct")
     p.add_argument("--norm-stats-json", default=None)
     p.add_argument("--judge", action="store_true", help="also run the Mimir patch-back judge (KL at the position)")
     p.add_argument("--max-new-tokens", type=int, default=300)
@@ -91,7 +91,7 @@ def main() -> None:
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
-    model, tok = load_verbalizer(args.verbalizer_model, device=args.device, torch_dtype=dtype)
+    model, tok = load_verbalizer(resolve_verbalizer_model(args.verbalizer_model, args.av_ckpt), device=args.device, torch_dtype=dtype)
     inj_L, inj_H, heads = load_rl_checkpoint(model, args.av_ckpt, args.ar_ckpt, _D_MIMIR,
                                              model.config.hidden_size, args.device)
     ids_meta = (tm.injection_token_id_L, tm.injection_left_neighbor_id_L, tm.injection_right_neighbor_id_L,

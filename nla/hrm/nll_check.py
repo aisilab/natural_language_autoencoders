@@ -24,8 +24,8 @@ from nla.datagen.storage import LocalStorage
 from nla.hrm.build import _INJECT_H_PLACEHOLDER, _INJECT_L_PLACEHOLDER, prefix_token_mask, token_prefix, wrap_lh_explanation
 from nla.hrm.devices import default_device, default_dtype
 from nla.hrm.model import (
-    DEFAULT_VERBALIZER, InjectionAdapter, ReconHeads, build_inputs_embeds, load_extra_modules,
-    load_sft_adapter, load_verbalizer,
+    InjectionAdapter, ReconHeads, build_inputs_embeds, load_extra_modules,
+    load_sft_adapter, load_verbalizer, resolve_verbalizer_model, response_token_ce,
 )
 from nla.hrm.sidecar import read_sidecar
 from nla.hrm.train_av_sft import _build_example, _collate
@@ -52,10 +52,8 @@ def mean_nll(model, examples, inj_L, inj_H, ids_meta, pad_id, device, z_override
                 n_prompt = sum(1 for x in e["labels"] if x == -100)
                 pmask[i, n_prompt : n_prompt + len(pm)] = torch.tensor(pm, device=device)
         embeds = build_inputs_embeds(model, input_ids, z_L, z_H, inj_L, inj_H, *ids_meta)
-        logits = model(inputs_embeds=embeds, attention_mask=attn).logits[:, :-1].float()
         tgt, pm_t = labels[:, 1:], pmask[:, 1:]
-        nll = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1),
-                                                ignore_index=-100, reduction="none").view_as(tgt)
+        nll = response_token_ce(model, embeds, attn, labels)
         valid = tgt != -100
         total += nll[valid].sum().item()
         n_tok += valid.sum().item()
@@ -71,7 +69,7 @@ def main() -> None:
     p.add_argument("--sidecar-from", required=True, help="a built av_sft/rl parquet: supplies markers and the actor template")
     p.add_argument("--av-ckpt", required=True, help="dir containing av/ and extra_modules.safetensors "
                                                     "(ckpt/av_sft, or ckpt/rl_logr/final)")
-    p.add_argument("--verbalizer-model", default=DEFAULT_VERBALIZER)
+    p.add_argument("--verbalizer-model", default=None, help="default: the backbone recorded in --av-ckpt, else Qwen2.5-1.5B-Instruct")
     p.add_argument("--prefix-token", action="store_true",
                     help="score against targets with the 'Marked token: \"X\".' prefix (use for AV checkpoints trained "
                          "from data built with build.py --prefix-token; needs the context_marked column)")
@@ -89,7 +87,7 @@ def main() -> None:
                 tm.injection_token_id_H, tm.injection_left_neighbor_id_H, tm.injection_right_neighbor_id_H)
     actor_content = meta.prompt_templates["actor"].format(inj_L=_INJECT_L_PLACEHOLDER, inj_H=_INJECT_H_PLACEHOLDER)
 
-    model, tok = load_verbalizer(args.verbalizer_model, device=args.device, torch_dtype=dtype)
+    model, tok = load_verbalizer(resolve_verbalizer_model(args.verbalizer_model, args.av_ckpt), device=args.device, torch_dtype=dtype)
     d_verb = model.config.hidden_size
     load_sft_adapter(model, args.av_ckpt, "av")
     inj_L, inj_H = InjectionAdapter(_D_MIMIR, d_verb).to(args.device), InjectionAdapter(_D_MIMIR, d_verb).to(args.device)

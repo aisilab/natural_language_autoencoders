@@ -33,7 +33,7 @@ from tqdm import tqdm
 from nla.hrm.devices import default_device, default_dtype
 from nla.hrm.build import _INJECT_H_PLACEHOLDER, _INJECT_L_PLACEHOLDER
 from nla.hrm.diagnostics import compute_stream_stats
-from nla.hrm.model import DEFAULT_VERBALIZER, last_real_index, load_rl_checkpoint, load_verbalizer
+from nla.hrm.model import critic_hidden, generate_kwargs, load_rl_checkpoint, load_verbalizer, resolve_verbalizer_model
 from nla.hrm.recon import ReconWeights, parse_fields, recon_loss
 from nla.hrm.sidecar import read_sidecar
 from nla.datagen.storage import LocalStorage
@@ -99,12 +99,13 @@ def generate_and_reconstruct(model, tokenizer, rows, inj_l_char, inj_h_char, inj
             embeds = build_inputs_embeds(model, input_ids, z_L, z_H, inj_L, inj_H, *ids_meta)
             model.set_adapter("av")
             gen_ids = model.generate(inputs_embeds=embeds, attention_mask=attn, max_new_tokens=max_new_tokens,
-                                       do_sample=False, pad_token_id=tokenizer.pad_token_id)
+                                       do_sample=False, pad_token_id=tokenizer.pad_token_id,
+                                       **generate_kwargs(model, attn))
             cand_texts = [tokenizer.batch_decode(gen_ids, skip_special_tokens=True)]
             for _ in range(best_of - 1):
                 sampled = model.generate(inputs_embeds=embeds, attention_mask=attn, max_new_tokens=max_new_tokens,
                                            do_sample=True, temperature=sample_temperature, top_p=1.0, top_k=0,
-                                           pad_token_id=tokenizer.pad_token_id)
+                                           pad_token_id=tokenizer.pad_token_id, **generate_kwargs(model, attn))
                 cand_texts.append(tokenizer.batch_decode(sampled, skip_special_tokens=True))
 
 
@@ -120,8 +121,7 @@ def generate_and_reconstruct(model, tokenizer, rows, inj_l_char, inj_h_char, inj
                 c_enc = tokenizer(l_texts + h_texts, return_tensors="pt", padding=True,
                                     add_special_tokens=False, truncation=True, max_length=512)
                 c_ids, c_attn = c_enc["input_ids"].to(device), c_enc["attention_mask"].to(device)
-                c_out = model(input_ids=c_ids, attention_mask=c_attn, output_hidden_states=True, logits_to_keep=1)
-                h_last = c_out.hidden_states[-1][torch.arange(c_ids.shape[0]), last_real_index(c_attn, critic_readout)]
+                h_last = critic_hidden(model, c_ids, c_attn, critic_readout)
                 n = len(ok_idx)
                 zL_pred, zH_pred = heads.forward_L(h_last[:n]), heads.forward_H(h_last[n:])
                 for j, i in enumerate(ok_idx):
@@ -174,7 +174,7 @@ def _split_greedy(model, tokenizer, batch_rows, inj_l_char, inj_h_char, inj_L, i
         embeds = build_inputs_embeds(model, input_ids, z_L, z_H, inj_L, inj_H, *ids_meta)
         model.set_adapter("av")
         gen = model.generate(inputs_embeds=embeds, attention_mask=attn, max_new_tokens=max_new_tokens,
-                             do_sample=False, pad_token_id=tokenizer.pad_token_id)
+                             do_sample=False, pad_token_id=tokenizer.pad_token_id, **generate_kwargs(model, attn))
         outs[described] = tokenizer.batch_decode(gen, skip_special_tokens=True)
     return [join_split(a, b) for a, b in zip(outs["L"], outs["H"], strict=True)]
 
@@ -454,7 +454,7 @@ def main() -> None:
         torch.manual_seed(0)  # reproducible candidate sampling
     mean_mse = json.load(open(args.norm_stats_json))["mean_mse"] if args.norm_stats_json else None
 
-    verbalizer_model = args.verbalizer_model or DEFAULT_VERBALIZER
+    verbalizer_model = resolve_verbalizer_model(args.verbalizer_model, args.av_ckpt)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
     model, tokenizer = load_verbalizer(verbalizer_model, device=args.device, torch_dtype=dtype)
     d_verb = model.config.hidden_size

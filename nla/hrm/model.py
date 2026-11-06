@@ -14,17 +14,28 @@ HRM target.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from safetensors.torch import load_file, save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from nla.injection import inject_at_marked_positions
 
 DEFAULT_VERBALIZER = "Qwen/Qwen2.5-1.5B-Instruct"
 
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def is_mimir(model_or_config) -> bool:
+    """True if the (PEFT-wrapped) model or its config is an HRM-Text (Mimir) model, i.e. the verbalizer backbone is a copy of
+    the target model instead of Qwen. Everything Mimir-specific below is gated on this, so Qwen behaviour is unchanged."""
+    cfg = getattr(model_or_config, "config", model_or_config)
+    return getattr(cfg, "model_type", None) == "hrm_text"
 
 
 def load_verbalizer(
@@ -37,11 +48,13 @@ def load_verbalizer(
     """Frozen base + two LoRA adapters ('av', 'ar'). `model.set_adapter(name)`
     switches which one is active for a forward pass; the base's own weights
     are never updated (`get_peft_model` freezes everything not matched by
-    `target_modules`)."""
+    `target_modules`). `model_name` may be Mimir itself (a Mimir-native AV/AR pair, `docs/hrm.md`): the same LoRA recipe
+    applies (module names match), attention is forced to sdpa (the PrefixLM mask is not representable otherwise)."""
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype).to(device)
+    extra = {"attn_implementation": "sdpa"} if is_mimir(AutoConfig.from_pretrained(model_name)) else {}
+    base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype, **extra).to(device)
     lora_cfg = LoraConfig(
         r=lora_r, lora_alpha=lora_alpha, target_modules=LORA_TARGET_MODULES,
         lora_dropout=0.0, task_type="CAUSAL_LM",
@@ -164,6 +177,85 @@ def build_inputs_embeds(
     embeds = inject_at_marked_positions(input_ids, embeds, vec_l, inj_l_id, left_l_id, right_l_id)
     embeds = inject_at_marked_positions(input_ids, embeds, vec_h, inj_h_id, left_h_id, right_h_id)
     return embeds
+
+
+def _positions(attn: torch.Tensor) -> torch.Tensor:
+    """Position ids that ignore padding (what `generate` derives from the attention mask), so a left-padded row sees the
+    same positions as when it is alone."""
+    return (attn.long().cumsum(dim=-1) - 1).clamp(min=0)
+
+
+def generate_kwargs(model, attn: torch.Tensor) -> dict:
+    """Extra `generate(inputs_embeds=...)` kwargs: for Mimir the whole prompt is ONE bidirectional block (as when Mimir reads
+    a rendered prompt), the generated tokens are causal. {} for other backbones."""
+    return {"token_type_ids": attn.long()} if is_mimir(model) else {}
+
+
+def forward_kwargs(model, attn: torch.Tensor, prompt_mask: torch.Tensor | None = None, n_prompt: int | None = None) -> dict:
+    """Extra kwargs for a teacher-forced forward over [prompt | response] that must match `generate_kwargs` decoding.
+    `prompt_mask` [B, S] marks prompt tokens (e.g. labels == -100 with right padding); `n_prompt` marks the first n columns
+    (left-padded batches). With neither, every attended token is prompt. {} for other backbones."""
+    if not is_mimir(model):
+        return {}
+    if prompt_mask is not None:
+        tt = prompt_mask.long() * attn.long()
+    elif n_prompt is not None:
+        tt = attn.long() * (torch.arange(attn.shape[1], device=attn.device) < n_prompt).long().unsqueeze(0)
+    else:
+        tt = attn.long()
+    return {"token_type_ids": tt, "position_ids": _positions(attn)}
+
+
+def critic_hidden(model, input_ids: torch.Tensor, attn: torch.Tensor, readout: str = "last") -> torch.Tensor:
+    """[B, d] AR readout at the last real token under the active ('ar') adapter. Qwen: last hidden state; Mimir: final H
+    output with the whole text bidirectional (`nla/hrm/mimir_ar.py`). Correct for left and right padding."""
+    idx = last_real_index(attn, readout)
+    if is_mimir(model):
+        h = model.get_base_model().model(input_ids=input_ids, attention_mask=attn, token_type_ids=attn.long(),
+                                         position_ids=_positions(attn)).last_hidden_state
+    else:
+        # logits_to_keep=1: only hidden states are needed; do not build [B, T, vocab] logits.
+        h = model(input_ids=input_ids, attention_mask=attn, output_hidden_states=True, logits_to_keep=1).hidden_states[-1]
+    return h[torch.arange(input_ids.shape[0], device=h.device), idx]
+
+
+def response_token_ce(model, embeds: torch.Tensor, attn: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Per-token cross-entropy [B, S-1] of the shifted labels (0 where labels == -100) for an AV forward over
+    [prompt | response] (right padded; prompt = labels == -100 among attended tokens). Mimir: the LM head is applied to the
+    response positions only (vocab 262,144, so full logits are several GB per batch)."""
+    shift = labels[:, 1:]
+    if not is_mimir(model):
+        logits = model(inputs_embeds=embeds, attention_mask=attn).logits[:, :-1]
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), shift.reshape(-1),
+                               ignore_index=-100, reduction="none").view_as(shift)
+    kw = forward_kwargs(model, attn, prompt_mask=(labels == -100))
+    base = model.get_base_model()
+    h = base.model(inputs_embeds=embeds, attention_mask=attn, **kw).last_hidden_state[:, :-1]
+    sel = shift != -100
+    ce = torch.zeros(shift.shape, device=h.device, dtype=torch.float32)
+    ce[sel] = F.cross_entropy(base.lm_head(h[sel]).float(), shift[sel], reduction="none")
+    return ce
+
+
+def write_backbone(ckpt_dir: str, model_name: str) -> None:
+    """Record which base model a checkpoint was trained on (`backbone.json`), so eval/infer need no extra flag."""
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+    (Path(ckpt_dir) / "backbone.json").write_text(json.dumps({"verbalizer_model": model_name}))
+
+
+def read_backbone(ckpt_dir: str | None) -> str | None:
+    f = Path(ckpt_dir) / "backbone.json" if ckpt_dir else None
+    return json.loads(f.read_text())["verbalizer_model"] if f is not None and f.exists() else None
+
+
+def resolve_verbalizer_model(arg: str | None, *ckpt_dirs: str | None) -> str:
+    """--verbalizer-model if given, else the backbone recorded in the first checkpoint that has one, else the Qwen default.
+    A mismatch between the flag and a recorded backbone is only warned about (a local copy of the same model has another
+    name); loading adapters into a different architecture fails on shapes."""
+    recorded = next((b for b in (read_backbone(d) for d in ckpt_dirs) if b), None)
+    if arg is not None and recorded is not None and arg != recorded:
+        print(f"[warning] --verbalizer-model {arg} differs from the checkpoint's recorded backbone {recorded}")
+    return arg or recorded or DEFAULT_VERBALIZER
 
 
 def last_real_index(attn: torch.Tensor, readout: str = "last") -> torch.Tensor:

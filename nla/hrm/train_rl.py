@@ -37,9 +37,8 @@ from nla.hrm.devices import default_device, default_dtype
 from nla.datagen.storage import LocalStorage
 from nla.hrm.build import _INJECT_H_PLACEHOLDER, _INJECT_L_PLACEHOLDER
 from nla.hrm.model import (
-    DEFAULT_VERBALIZER, add_frozen_reference_adapter, build_inputs_embeds,
-    load_rl_checkpoint, load_verbalizer, save_extra_modules,
-    last_real_index,
+    add_frozen_reference_adapter, build_inputs_embeds, critic_hidden, forward_kwargs, generate_kwargs,
+    load_rl_checkpoint, load_verbalizer, resolve_verbalizer_model, save_extra_modules, write_backbone,
 )
 from nla.hrm.verifiable import split_call_rewards, verifiable_bonus, verifiable_terms
 from nla.hrm.recon import ReconLoss, ReconWeights, failed_reward, loss_to_reward, parse_fields, recon_loss
@@ -96,6 +95,7 @@ def _generate_batch(model, tokenizer, rows, inj_l_char, inj_h_char, inj_L, inj_H
     out_ids = model.generate(
         inputs_embeds=embeds, attention_mask=attn, max_new_tokens=max_new_tokens,
         do_sample=True, temperature=temperature, top_p=1.0, pad_token_id=tokenizer.pad_token_id,
+        **generate_kwargs(model, attn),
     )
     # generate() with inputs_embeds returns ONLY the newly generated tokens
     # (it never sees input_ids to prepend) — reconstruct the full sequence
@@ -132,9 +132,7 @@ def _critic_hidden(model, tokenizer, texts: list[str], device: str) -> torch.Ten
     enc = tokenizer(texts, return_tensors="pt", padding=True, add_special_tokens=False,
                      truncation=True, max_length=512)
     ids, attn = enc["input_ids"].to(device), enc["attention_mask"].to(device)
-    # logits_to_keep=1: we only need hidden states; don't build [B, T, vocab] logits.
-    out = model(input_ids=ids, attention_mask=attn, output_hidden_states=True, logits_to_keep=1)
-    return out.hidden_states[-1][torch.arange(ids.shape[0]), last_real_index(attn, _CRITIC_READOUT)]
+    return critic_hidden(model, ids, attn, _CRITIC_READOUT)
 
 
 def _critic_hidden_nograd(model, tokenizer, texts: list[str], device: str) -> torch.Tensor:
@@ -197,7 +195,8 @@ def _response_logprobs(model, adapter: str, embeds, attn, targets, S: int) -> to
     to positions S-1..end, so we never build [N, seq, vocab] logits for the prompt."""
     model.set_adapter(adapter)
     k = embeds.shape[1] - S + 1
-    logits = model(inputs_embeds=embeds, attention_mask=attn, logits_to_keep=k).logits[:, :-1]
+    logits = model(inputs_embeds=embeds, attention_mask=attn, logits_to_keep=k,
+                   **forward_kwargs(model, attn, n_prompt=S)).logits[:, :-1]
     return torch.log_softmax(logits.float(), dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
 
@@ -234,7 +233,9 @@ def main() -> None:
     p.add_argument("--eval-parquet", default=None)
     p.add_argument("--av-sft-ckpt", required=True, help="train_av_sft.py's --output dir (contains av/adapter_config.json)")
     p.add_argument("--ar-sft-ckpt", required=True, help="train_ar_sft.py's --output dir (contains ar/adapter_config.json)")
-    p.add_argument("--verbalizer-model", default=None)
+    p.add_argument("--verbalizer-model", default=None,
+                    help="default: the backbone recorded in --av-sft-ckpt/backbone.json, else Qwen2.5-1.5B-Instruct. "
+                         "danish-foundation-models/DFM-Mimir-v1.5 = Mimir-native AV and AR (injection at the input embedding)")
     p.add_argument("--device", default=default_device())
     p.add_argument("--dtype", choices=["float32", "bfloat16"], default=default_dtype())
     p.add_argument("--batch-size", type=int, default=8, help="B activation rows per step")
@@ -281,7 +282,7 @@ def main() -> None:
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
-    verbalizer_model = args.verbalizer_model or DEFAULT_VERBALIZER
+    verbalizer_model = resolve_verbalizer_model(args.verbalizer_model, args.av_sft_ckpt)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
     weights = ReconWeights(w_sum=args.w_sum, w_comp=args.w_comp)
     norm_path = args.norm_stats_json or str(Path(args.rl_parquet).parent / "norm_stats.json")
@@ -428,6 +429,7 @@ def main() -> None:
 def _save(model, inj_L, inj_H, heads, path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(path, selected_adapters=["av", "ar"])
+    write_backbone(path, model.get_base_model().config._name_or_path)
     save_extra_modules(f"{path}/extra_modules.safetensors", inj_L, inj_H, heads)
 
 
