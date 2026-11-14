@@ -27,6 +27,7 @@ and the RAW gold z_L/z_H already extracted into the RL parquet.
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -339,6 +340,7 @@ def main() -> None:
     with tqdm(total=args.steps) as pbar:
         while step < args.steps:
             batch_rows = [rows[i % len(rows)] for i in range(step * args.batch_size, (step + 1) * args.batch_size)]
+            t_step = time.time()
             if args.split_av:
                 full_ids, full_attn, S, texts_L, z_L, z_H = _generate_batch(
                     model, tokenizer, batch_rows, inj_l_char, inj_h_char, inj_L, inj_H, ids_meta, args.device,
@@ -356,8 +358,10 @@ def main() -> None:
                     args.group_size, args.max_new_tokens, args.temperature,
                 )
                 cjk_texts = texts
+            t_gen = time.time() - t_step
             rewards, parsed, mses = compute_rewards(model, tokenizer, heads, critic_template, texts, z_L, z_H,
                                                 weights, args.device, args.log_reward)
+            t_rew = time.time() - t_step - t_gen
             fve = fve_from_mses(mses, baseline)
             verif = {}
             if args.w_token or args.w_ground:
@@ -381,6 +385,7 @@ def main() -> None:
                 adv_L, adv_H = _advantages(rewards_L), _advantages(rewards_H)
                 verif.update({f"fact_{k}": v for k, v in fact_rates.items()})
 
+            t_p0 = time.time()
             if args.split_av:
                 pg_a, kl_a = policy_step(model, full_ids, full_attn, S, adv_L, inj_L, inj_H, ids_meta,
                                            z_L, z_H, policy_optim, args.kl_beta, args.device, mask_stream="H")
@@ -390,8 +395,10 @@ def main() -> None:
             else:
                 pg_loss, kl_loss = policy_step(model, full_ids, full_attn, S, advantages, inj_L, inj_H, ids_meta,
                                                  z_L, z_H, policy_optim, args.kl_beta, args.device)
+            t_pol = time.time() - t_p0
             ar_loss = ar_update_step(model, tokenizer, heads, ar_optim, critic_template, parsed, z_L, z_H,
                                        weights, args.device)
+            t_ar = time.time() - t_p0 - t_pol
 
             n_malformed = sum(p is None for p in parsed)
             n_cjk_leak = sum(bool(_CJK_RE.search(t)) for t in cjk_texts)
@@ -410,7 +417,8 @@ def main() -> None:
             if step % 5 == 0 or step == 1:
                 print(f"step={step} mean_reward={sum(rewards)/len(rewards):.4f} pg_loss={pg_loss:.4f} "
                       f"kl={kl_loss:.5f} ar_loss={ar_loss.total.item() if ar_loss else float('nan'):.4f} "
-                      f"malformed={n_malformed}/{len(texts)} cjk_leak={n_cjk_leak}/{len(cjk_texts)}"
+                      f"malformed={n_malformed}/{len(texts)} cjk_leak={n_cjk_leak}/{len(cjk_texts)} "
+                      f"sec[gen={t_gen:.0f} reward={t_rew:.0f} policy={t_pol:.0f} ar={t_ar:.0f}]"
                       + "".join(f" {k}={v:.3f}" for k, v in {**fve, **verif}.items()))
                 if n_cjk_leak > 0:
                     print(f"  WARNING: {n_cjk_leak} completions contain CJK chars — possible injection failure "
